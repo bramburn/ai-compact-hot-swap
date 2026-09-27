@@ -1,0 +1,38 @@
+# Source-control and CI noise
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Pi per-user config (not part of the extension)
+.pi/
+
+# Local environment overrides
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript build config (pi loads .ts directly — consumers don't need this)
+tsconfig.json
+
+# Dev-only install hint
+.npmignore

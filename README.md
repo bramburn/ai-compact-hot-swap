@@ -13,7 +13,15 @@ When compaction finishes you get a notification (`Hot swap applied: context repl
 
 ## Install
 
-Copy or symlink this directory into either:
+```sh
+# From npm (recommended)
+pi install npm:@bramburn/ai-compact-hot-swap
+
+# …or from a local checkout
+pi install ./ai-compact-hot-swap
+```
+
+Or copy or symlink this directory into either:
 
 - `~/.pi/agent/extensions/ai-compact-hot-swap` (available in every project), or
 - `<project>/.pi/extensions/ai-compact-hot-swap` (project-local)
@@ -22,6 +30,8 @@ Or run it ad-hoc for one session:
 
 ```sh
 pi -e /path/to/ai-compact-hot-swap/index.ts
+# or, after install:
+pi -e npm:@bramburn/ai-compact-hot-swap
 ```
 
 ## Usage
@@ -62,10 +72,11 @@ The registered model uses hardcoded defaults of `contextWindow: 1_000_000` and `
 - **Extension reloaded mid-compaction** — all state lives in the extension instance, so a reload loses the pending flag and the in-flight compaction's completion callback. The session is unaffected (compaction still completes server-side); only the notification is lost.
 - **No UI** — notifications are skipped when running headless (`ctx.hasUI` guard), except the partial-env warning which also goes to `console.warn`.
 
-## Typecheck
+## Typecheck (development)
 
 ```sh
-npx tsgo --noEmit -p tsconfig.json
+npm install
+npm run typecheck
 ```
 
-(The tsconfig maps `@earendil-works/pi-coding-agent` to a local pi checkout for types; adjust the path or install the package if your layout differs.)
+The bundled `tsconfig.json` maps `@earendil-works/pi-coding-agent` to a local pi checkout for types — adjust the `paths` entry (or remove it and rely on the installed peer dep) if your layout differs.
