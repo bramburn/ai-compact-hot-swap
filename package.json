@@ -1,0 +1,11 @@
+{
+	"name": "ai-compact-hot-swap",
+	"version": "0.1.0",
+	"private": true,
+	"description": "pi coding-agent extension: background compaction with hot-swap of the live context window",
+	"type": "module",
+	"main": "index.ts",
+	"scripts": {
+		"typecheck": "tsgo --noEmit -p tsconfig.json"
+	}
+}

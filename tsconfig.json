@@ -1,0 +1,21 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": true,
+		"erasableSyntaxOnly": true,
+		"types": ["node"],
+		"typeRoots": ["C:/dev/pi/node_modules/@types"],
+		"paths": {
+			"@earendil-works/pi-coding-agent": [
+				"C:/dev/pi/packages/coding-agent/dist/index.d.ts"
+			]
+		}
+	},
+	"include": ["index.ts"]
+}
