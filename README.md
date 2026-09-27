@@ -9,7 +9,7 @@ pi's built-in `/compact` aborts the in-flight turn and blocks until summarizatio
 - **Idle session** — compaction starts immediately in the background via `ctx.compact({ onComplete, onError })`.
 - **Busy session (turn in flight)** — compaction is queued instead of run, because `AgentSession.compact()` would abort the running turn. The queued compaction fires automatically on the next `turn_end` event. Re-invoking the command while one is queued or running just reports the existing state; only one pending compaction is tracked at a time.
 
-When compaction finishes you get a notification (`Hot swap applied: context replaced by summary (backlog through turn N)`), where N is the session entry count captured at trigger time so you know the range of history that was swapped. Failures are notified too, and internal state is cleared.
+When compaction finishes you get a notification (`Hot swap applied: context replaced by summary (backlog through entry N)`), where N is the session entry count captured at trigger time so you know the range of history that was swapped. Failures are notified too, and internal state is cleared.
 
 ## Install
 
@@ -51,6 +51,10 @@ Optional:
 | `PI_HOTSWAP_SUMMARIZER_PROVIDER` | Provider id label used for registration (default `hotswap-summarizer`) |
 
 If only some of the three required vars are set, the extension warns and falls back to the session's current model — mirroring pi's `PI_SUMMARIZER_*` contract. When all three are set, the extension registers a provider (guarded against duplicate registration) and performs the summarization itself via `session_before_compact`, returning `{ compaction }` so pi applies the result exactly like a normal compaction.
+
+Note: once the `PI_HOTSWAP_SUMMARIZER_*` env vars are set, the custom summarizer handles **all** compactions in the session — not just `/hot-swap-compact`. That includes the built-in `/compact` command, threshold-based auto-compaction, and context-overflow recovery. Unset the env vars (or run without them) to restore pi's default summarization everywhere.
+
+The registered model uses hardcoded defaults of `contextWindow: 1_000_000` and `maxTokens: 8192`. These only need to be accurate enough for pi's request budgeting: `maxTokens` caps the summary length the endpoint will return, and `contextWindow` should be at least as large as the conversation you expect to summarize (pi does not chunk the prompt for extension-provided summarizations, so if the real endpoint model has a smaller window, a very long session can overflow it). If your endpoint's real limits are much lower, reduce `contextWindow` accordingly.
 
 ## Edge cases
 

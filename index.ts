@@ -50,7 +50,7 @@ function resolveSummarizerEnv(): HotswapSummarizerEnv | undefined | "partial" {
 			!model && MODEL_ENV,
 		].filter((name): name is string => !!name);
 		console.warn(
-			`[hot-swap-compact] ${PROVIDER_ENV.replace("PROVIDER", "SUMMARIZER")} override is incomplete ` +
+			`[hot-swap-compact] PI_HOTSWAP_SUMMARIZER_* override is incomplete ` +
 				`(missing: ${missing.join(", ")}). Falling back to the session's current model for compaction.`,
 		);
 		return "partial";
@@ -81,7 +81,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			triggerEntryCount = undefined;
 		}
-		notify(ctx, `Hot-swap compaction started in background (turn ${triggerEntryCount ?? "?"})...`, "info");
+		notify(ctx, `Hot-swap compaction started in background (entry ${triggerEntryCount ?? "?"})...`, "info");
 		ctx.compact({
 			customInstructions,
 			onComplete: () => {
@@ -91,7 +91,7 @@ export default function (pi: ExtensionAPI) {
 				notify(
 					ctx,
 					triggerEntryCount !== undefined
-						? `Hot swap applied: context replaced by summary (backlog through turn ${triggerEntryCount}).`
+						? `Hot swap applied: context replaced by summary (backlog through entry ${triggerEntryCount}).`
 						: "Hot swap applied: context replaced by summary.",
 					"info",
 				);
@@ -100,7 +100,15 @@ export default function (pi: ExtensionAPI) {
 				compacting = false;
 				pending = false;
 				pendingInstructions = undefined;
-				notify(ctx, `Hot-swap compaction failed: ${error.message}`, "error");
+				const cancelled =
+					error.name === "AbortError" ||
+					error.message === "Compaction cancelled" ||
+					error.message.includes("cancelled");
+				notify(
+					ctx,
+					cancelled ? "Hot-swap compaction cancelled." : `Hot-swap compaction failed: ${error.message}`,
+					cancelled ? "warning" : "error",
+				);
 			},
 		});
 	};
@@ -110,12 +118,11 @@ export default function (pi: ExtensionAPI) {
 		const env = summarizerEnv;
 
 		pi.on("session_before_compact", async (event, ctx) => {
-			const { preparation, signal } = event;
+			const { preparation, signal, customInstructions } = event;
 			const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } =
 				preparation;
 
 			if (!providerRegistered) {
-				providerRegistered = true;
 				pi.registerProvider(env.providerId, {
 					name: "Hot-swap Summarizer",
 					baseUrl: env.baseUrl,
@@ -133,6 +140,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 				});
+				providerRegistered = true;
 			}
 
 			const model = ctx.modelRegistry.find(env.providerId, env.model);
@@ -146,6 +154,7 @@ export default function (pi: ExtensionAPI) {
 			const previousContext = previousSummary
 				? `\n\nPrevious session summary for context:\n${previousSummary}`
 				: "";
+			const focus = customInstructions ? `\n\nAdditional focus: ${customInstructions}` : "";
 
 			const summaryMessages = [
 				{
@@ -164,7 +173,7 @@ export default function (pi: ExtensionAPI) {
 
 Be thorough but concise. The summary will replace the conversation history up to this point, so include all information needed to continue the work effectively.
 
-Format the summary as structured markdown with clear sections.
+Format the summary as structured markdown with clear sections.${focus}
 
 <conversation>
 ${conversationText}
@@ -194,7 +203,13 @@ ${conversationText}
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				notify(ctx, `Hot-swap summarization failed: ${message} (falling back is not possible; compaction aborted)`, "error");
+				if (!signal.aborted) {
+					notify(
+						ctx,
+						`Hot-swap summarization failed: ${message} (falling back to default compaction with the session model)`,
+						"warning",
+					);
+				}
 				return;
 			}
 		});
