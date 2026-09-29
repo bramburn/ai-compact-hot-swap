@@ -1,3 +1,12 @@
 node_modules/
 dist/
 *.log
+
+# pi extension doesn't ship a lockfile (consumers install the package, not this repo)
+package-lock.json
+
+# User-local pi runtime state (loops, session index, etc.)
+.pi/
+
+# npm pack output (used for verification, never committed)
+*.tgz

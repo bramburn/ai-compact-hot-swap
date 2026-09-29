@@ -1,11 +1,60 @@
 {
-	"name": "ai-compact-hot-swap",
-	"version": "0.1.0",
-	"private": true,
+	"name": "@bramburn/ai-compact-hot-swap",
+	"version": "0.1.1",
 	"description": "pi coding-agent extension: background compaction with hot-swap of the live context window",
+	"license": "MIT",
 	"type": "module",
 	"main": "index.ts",
+	"author": {
+		"name": "bramburn",
+		"url": "https://github.com/bramburn"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/bramburn/ai-compact-hot-swap.git"
+	},
+	"bugs": {
+		"url": "https://github.com/bramburn/ai-compact-hot-swap/issues"
+	},
+	"homepage": "https://github.com/bramburn/ai-compact-hot-swap#readme",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"keywords": [
+		"pi",
+		"pi-coding-agent",
+		"pi-package",
+		"compact",
+		"compaction",
+		"context",
+		"context-window",
+		"hot-swap",
+		"background"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"files": [
+		"index.ts",
+		"README.md",
+		"LICENSE"
+	],
 	"scripts": {
-		"typecheck": "tsgo --noEmit -p tsconfig.json"
+		"typecheck": "tsgo --noEmit -p tsconfig.json",
+		"test": "node scripts/smoke.mjs",
+		"prepublishOnly": "npm run typecheck"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.85.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.85.0",
+		"@types/node": "^22.19.0",
+		"@typescript/native-preview": "7.0.0-dev.20260120.1"
 	}
 }
