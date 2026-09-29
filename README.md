@@ -11,7 +11,31 @@ A [pi](https://github.com/earendil-works/pi) coding-agent extension providing a 
 pi's built-in `/compact` aborts the in-flight turn and blocks until summarization finishes. `/hot-swap-compact` never interrupts ongoing work:
 
 - **Idle session** — compaction starts immediately in the background via `ctx.compact({ onComplete, onError })`.
-- **Busy session (turn in flight)** — compaction is queued instead of run, because `AgentSession.compact()` would abort the running turn. The queued compaction fires automatically on the next `turn_end` event. Re-invoking the command while one is queued or running just reports the existing state; only one pending compaction is tracked at a time.
+- **Busy session** — compaction is queued instead of run, because `AgentSession.compact()` starts with `await this.abort()` and would kill the in-flight turn. Re-invoking the command while one is queued or running just reports the existing state; only one pending compaction is tracked at a time.
+
+### Why queueing is not enough: the looper race
+
+A naive "queue while busy, fire on `turn_end`" guard is still wrong, and the failure is subtle. `ctx.isIdle()` reads `!_isAgentRunActive && !isCompacting`, so a loop extension that schedules its next turn with a timer (pi-goal-x auto-continue, pi-loop, subagent workflows) looks **idle during the gap between turns by construction** — pi-goal-x uses a 50 ms gap. Compact in that gap and the `await this.abort()` inside `ctx.compact()` kills the continuation the *other* extension just queued, surfacing as `This operation was aborted.`
+
+So the extension waits for a genuinely safe window before compacting, requiring all three of:
+
+1. **Session free** — `ctx.isIdle()` *and* `!ctx.hasPendingMessages()`.
+2. **Idle stable for 750 ms** — continuously free for longer than any short-gap looper's inter-turn pause, so a gap is never mistaken for "finished". Armed by `turn_end` / `agent_settled`, cleared by `turn_start`.
+3. **No external busy guard** — a cross-extension opt-in for long-scheduled work (see below).
+
+A queued compaction polls every 250 ms and starts as soon as all three hold. If nothing frees up within 5 minutes it gives up with a notification and clears state rather than waiting forever. All poll timers are `unref`'d, so a pending queue never holds the host's event loop open.
+
+**The busy-guard registry.** The idle-stability window covers short-gap loopers but cannot tell "finished" from "sleeping for 30 s". Extensions that schedule work on a long timer can publish a guard that deferral honors:
+
+```ts
+const KEY = Symbol.for("pi.session.busyGuards");
+const registry = ((globalThis as any)[KEY] ??= []) as { id: string; isBusy(): boolean }[];
+const guard = { id: "my-extension", isBusy: () => nextRunAt > Date.now() };
+registry.push(guard);
+// …and remove it on unload
+```
+
+Reads are defensive: a missing registry, a non-array, or a throwing `isBusy()` is treated as "no external work scheduled", so this is purely an optimization and can never deadlock compaction. **No extension publishes to this registry yet** — including pi-goal-x, which relies on the idle-stability window alone. The hook is stable and documented so publishers can adopt it without coordinating releases.
 
 When compaction finishes you get a notification (`Hot swap applied: context replaced by summary (backlog through entry N)`), where N is the session entry count captured at trigger time so you know the range of history that was swapped. Failures are notified too, and internal state is cleared.
 
@@ -115,11 +139,12 @@ If you want the summarization step to use a **different model** than the one run
 
 The three must be set **as a group** — see "Partial configuration" below for the exact behavior when one or two are missing.
 
-### Optional env var
+### Optional env vars
 
 | Env var | Meaning |
 | --- | --- |
 | `PI_HOTSWAP_SUMMARIZER_PROVIDER` | Internal id used to register the summarizer with pi's provider registry. Defaults to `hotswap-summarizer`. You only need to override this if the default id collides with another provider you've registered elsewhere — either via `~/.pi/agent/models.json` or another extension. If you see a `provider already registered` error in the logs, set this to a unique value like `bramburn-hotswap-summarizer` to disambiguate. |
+| `PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW` | Positive integer telling the extension the summarizer's **real** context window in tokens (e.g. `128000`). Used to size batches for chunked summarization. When unset, the extension probes `${BASE_URL}/models` (and `/v1/models`) once per session for a `context_window` / `max_context_length` / `max_input_tokens` field; on miss it falls back to a conservative `128_000` default. Non-numeric values produce a stderr warning and fall through to the probe. |
 
 ### What happens at runtime
 
@@ -132,6 +157,20 @@ When **all three required vars are set**, the extension registers your endpoint 
  - Returns `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }` to pi. This is the same shape pi's built-in summarizer returns, so pi applies the result to the session exactly as if it had summarized itself — the backlog is replaced by the summary, kept entries are preserved, and the session continues with the new context.
 
 If the registered model can't be found, returns an empty summary, or throws, the extension emits a notification (`Hot-swap summarizer model not found`, `Hot-swap summary was empty`, or `Hot-swap summarization failed: ...`) and returns `undefined`. pi then falls back to its default summarization and the compaction still completes.
+
+### Handling summarizers smaller than the conversation (chunking)
+
+The registered model advertises `contextWindow: 1_000_000` to pi so pi doesn't pre-truncate the conversation it hands the extension. **That advertised value is not what the summarizer actually has** — most endpoints cap out well below 1M (Ollama defaults to 2048, llama3.1:8b to 128k, etc.). When the conversation exceeds the real window, the extension's chunking path kicks in:
+
+1. **Resolve the real window** in this order: `PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW` → probe `${BASE_URL}/models` for a `context_window` / `max_context_length` / `max_input_tokens` field → `128_000` fallback. The probe result is cached for the session.
+2. **Estimate** the serialized conversation size with a conservative chars/4 heuristic.
+3. **Single-shot** when the estimate fits in `(realWindow - 16384 reserve - 4000 prompt overhead)` — no overhead added.
+4. **Otherwise chunk**: split the messages into batches that fit the budget, never splitting a single message across batches. Summarize each batch sequentially, threading the previous summary's text into the next batch's prompt as `previousSummary`. Cap the previous summary at ~8K tokens to keep each subsequent prompt within budget. A user notification (`Hot-swap summarizer: chunked summary N/M...`) fires for each batch.
+5. **Catch-overflow retry**: if the upstream still rejects with a context-overflow error (estimate was off, or the endpoint has a smaller window than advertised), the extension re-chunks with **half the batch budget** and retries once. If the retry also fails, it falls back to pi's default summarizer with a warning.
+
+The rolling-summary approach is intentional: each batch sees both the previous summary and its own slice of the conversation, so the final output captures the full history. The summarizer's instruction text explicitly tells it to "build on the previous summary — preserve its conclusions and add only the new information from this batch."
+
+You should set `PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW` whenever you know the true value (always — it's free and the cheapest source in the chain). The endpoint probe covers providers that publish the field (OpenRouter, vLLM, Ollama with `--verbose`, etc.); for everything else the 128K fallback is conservative enough that most summarization requests succeed without retry.
 
 ### Partial configuration
 
@@ -167,13 +206,15 @@ Unset the env vars and start a new session to restore pi's default summarization
 The registered model advertises `contextWindow: 1_000_000` and `maxTokens: 8192` to pi. These are budgeting hints for pi, not hard limits enforced against your endpoint:
 
 - `maxTokens` caps the length of the summary your endpoint is allowed to return.
-- `contextWindow` should be at least as large as the longest conversation you expect to summarize in one shot. **pi does not chunk the prompt for extension-provided summarizations** — if your real endpoint has a smaller window (say 128k for Llama-3-class models), a very long session can overflow it and the call will fail. In that case, either pick a model with a larger native window or lower pi's auto-compact threshold so the conversation never grows that large.
+- `contextWindow` is intentionally large so pi doesn't pre-truncate the conversation it hands the extension. The actual chunking budget comes from `PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW` (or the endpoint probe, or the 128K fallback) — see "Handling summarizers smaller than the conversation (chunking)" above.
 
 ## Edge cases
 
 - **Compaction failure** — notified via `ui.notify` with level `error`; queued/running state is cleared.
 - **Extension reloaded mid-compaction** — all state lives in the extension instance, so a reload loses the pending flag and the in-flight compaction's completion callback. The session is unaffected (compaction still completes server-side); only the notification is lost.
 - **No UI** — notifications are skipped when running headless (`ctx.hasUI` guard), except the partial-env warning which also goes to `console.warn`.
+- **Summarizer endpoint probe fails** — cached as `probed-missing` so the extension doesn't repeatedly hit a flaky endpoint; subsequent compactions use the 128K fallback window.
+- **Catch-overflow retry also fails** — falls back to pi's default summarizer with a `warning` notification. The compaction still completes; you just don't get the cost/speed benefits of the custom summarizer for that one call.
 
 ## Updates
 
@@ -286,15 +327,37 @@ The extension is a single TypeScript file. The npm tarball publishes exactly 4 f
 - **Use the `pi` SDK only via `@earendil-works/pi-coding-agent`** — declared in `peerDependencies` (not bundled).
 - **Notifications** — prefer `ctx.ui.notify(level, message)` over `console.log` so headless runs stay quiet. Fall back to `console.warn` only for warnings the user must see regardless of UI state.
 
-### Typecheck & smoke test
+### Typecheck & test
 
 ```sh
 npm run typecheck    # tsgo --noEmit -p tsconfig.json
+npm test             # node scripts/smoke.mjs - 34 checks, 10 scenarios
 ```
 
 The bundled `tsconfig.json` maps `@earendil-works/pi-coding-agent` to a local pi checkout for types — adjust the `paths` entry (or remove it and rely on the installed peer dep) if your layout differs.
 
-End-to-end smoke test: install the published version into a throwaway project and confirm the extension loads:
+#### Automated smoke suite
+
+`scripts/smoke.mjs` runs one child process per scenario, because `index.ts` reads `process.env` at module-load time and a fresh module cache per scenario is the only way to test env-dependent registration. Each child imports the **real** `index.ts`, drives the real `session_before_compact` handler with a real `AbortController`, and stands up an actual `node:http` server for the endpoint-probe scenario - so the assertions exercise shipping code, not a mock of it.
+
+| Scenario | What it pins down |
+| --- | --- |
+| 1-2 | Handler is **not** registered with no env vars / partial env; the partial case warns on stderr naming the missing var |
+| 3 | Single-shot path for a small conversation; advertised `contextWindow` is 1 000 000 |
+| 4, 8 | Chunking fires when the conversation exceeds the resolved window (>1 `complete()` call) |
+| 5 | A real `context_length_exceeded` throw triggers the half-budget retry and still returns a summary |
+| 6 | A non-numeric `PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW` warns and falls through to the probe |
+| 7 | A working probe supplies the window - asserts the probed **65536**, not the 128 000 fallback, so the test cannot pass by coincidence |
+| 9 | Regression: goal-mode's 50 ms inter-turn gap must **not** compact (`compactCalls === 0`) |
+| 10 | A genuinely stable-idle session **does** compact, once the 750 ms window matures |
+
+Scenario 9 is the one that matters most. An earlier version of the poll loop left the re-armed timer referenced, so a queued compaction held the event loop open and that scenario never exited - the suite hung rather than failing. Keep `unref()` on **every** arm point; the suite only terminates if it is there.
+
+One assertion is verified by code reading rather than by a scenario: that a valid env hint takes precedence over a *working* probe. It is a one-line early return in `resolveSummarizerWindow()`, and both halves of it (env to probe, probe to used) are covered above.
+
+#### Manual end-to-end check
+
+Also worth doing before a release: install the published version into a throwaway project and confirm the extension loads:
 
 ```sh
 mkdir /tmp/pi-smoke && cd /tmp/pi-smoke
@@ -309,9 +372,9 @@ In the session, type `/hot-swap-compact` and confirm the command appears in the 
 
 1. Fork the repo.
 2. Create a topic branch: `git checkout -b fix/your-bug` or `feat/your-feature`.
-3. Make your change. Run `npm run typecheck` until clean.
+3. Make your change. Run `npm run typecheck && npm test` until both are clean.
 4. Commit with a descriptive message. If your change is user-visible, mention it in the PR description.
-5. Open a PR against `main`. CI (if you set it up) will re-run the typecheck.
+5. Open a PR against `main`. CI (if you set it up) will re-run the typecheck and the smoke suite.
 
 ### Release process
 

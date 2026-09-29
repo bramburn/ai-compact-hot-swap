@@ -46,6 +46,7 @@
 	],
 	"scripts": {
 		"typecheck": "tsgo --noEmit -p tsconfig.json",
+		"test": "node scripts/smoke.mjs",
 		"prepublishOnly": "npm run typecheck"
 	},
 	"peerDependencies": {
