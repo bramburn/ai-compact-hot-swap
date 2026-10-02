@@ -255,6 +255,36 @@ async function main() {
 		}
 	}
 
+	section("Scenario 11: PI_HOTSWAP_SUMMARIZER_IDLE_MS shortens the idle window");
+	{
+		const out = runScenario("custom-idle-window", {
+			PI_HOTSWAP_SUMMARIZER_IDLE_MS: "100",
+		});
+		assertTrue("subprocess OK", out.ok, out.stderr);
+		if (out.ok) {
+			assertEqual("compact called once", out.result.compactCalls, 1);
+			// With a 100 ms window the first 250 ms poll tick fires the
+			// compaction (~300 ms); the 750 ms default cannot fire before ~1 s.
+			assertTrue(
+				"compacted well before the default 750 ms window would allow",
+				typeof out.result.compactElapsedMs === "number" && out.result.compactElapsedMs > 0 && out.result.compactElapsedMs < 800,
+				`compact fired after ${out.result.compactElapsedMs} ms`,
+			);
+		}
+	}
+
+	section("Scenario 12: invalid PI_HOTSWAP_SUMMARIZER_IDLE_MS warns and falls back to the default");
+	{
+		const out = runScenario("bad-idle-window", {
+			PI_HOTSWAP_SUMMARIZER_IDLE_MS: "soon",
+		});
+		assertTrue("subprocess OK", out.ok, out.stderr);
+		if (out.ok) {
+			assertTrue("stderr warns about bad IDLE_MS", (out.stderr || "").includes("PI_HOTSWAP_SUMMARIZER_IDLE_MS"));
+			assertEqual("still compacts via the default window", out.result.compactCalls, 1);
+		}
+	}
+
 	console.log("");
 	if (failed === 0) {
 		console.log(`${GREEN}✓ All ${passed} checks passed${RESET}`);

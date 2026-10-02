@@ -22,6 +22,11 @@
  * on first use (cached). When neither is available, it falls back to a
  * conservative 128_000 default.
  *
+ * Optional idle-stability tuning (read regardless of the summarizer vars):
+ * PI_HOTSWAP_SUMMARIZER_IDLE_MS non-negative integer; how long the session
+ * must look continuously idle before a queued compaction fires
+ * (default 750 ms).
+ *
  * Install: copy or symlink this directory into ~/.pi/agent/extensions or a
  * project's .pi/extensions, or run ad-hoc with `pi -e path/to/index.ts`.
  */
@@ -72,6 +77,8 @@ const FALLBACK_CONTEXT_WINDOW = 128_000;
  */
 const SAFE_TO_COMPACT_POLL_MS = 250;
 
+const IDLE_STABILITY_ENV = "PI_HOTSWAP_SUMMARIZER_IDLE_MS";
+
 /**
  * How long the session must look continuously idle before we treat it as
  * genuinely finished.
@@ -87,8 +94,12 @@ const SAFE_TO_COMPACT_POLL_MS = 250;
  * Requiring a continuous idle window longer than the largest inter-turn gap
  * makes that race unreachable for short-gap loopers without any coupling to
  * a specific peer extension.
+ *
+ * Overridable via PI_HOTSWAP_SUMMARIZER_IDLE_MS — raise it above your
+ * looper's inter-turn gap if compactions keep aborting turns; see
+ * resolveIdleStabilityMs.
  */
-const IDLE_STABILITY_MS = 750;
+const DEFAULT_IDLE_STABILITY_MS = 750;
 
 /**
  * Upper bound on how long a queued compaction waits for a safe window
@@ -182,6 +193,27 @@ function resolveSummarizerEnv(): HotswapSummarizerEnv | undefined | "partial" {
 	}
 
 	return { baseUrl, apiKey, model, providerId, contextWindowHint };
+}
+
+/**
+ * Parses the optional idle-stability override.
+ *
+ * Unlike the summarizer vars this is NOT all-or-nothing and applies whether
+ * or not PI_HOTSWAP_SUMMARIZER_* is set — it tunes the trigger gating, not
+ * the summarizer. Non-numeric values warn on stderr and fall back to the
+ * default so a typo degrades to known behavior instead of disabling the
+ * guard.
+ */
+function resolveIdleStabilityMs(): number {
+	const raw = process.env[IDLE_STABILITY_ENV]?.trim();
+	if (!raw) return DEFAULT_IDLE_STABILITY_MS;
+	const parsed = Number.parseInt(raw, 10);
+	if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+	console.warn(
+		`[hot-swap-compact] ${IDLE_STABILITY_ENV}=${JSON.stringify(raw)} ` +
+			`is not a non-negative integer; using the default ${DEFAULT_IDLE_STABILITY_MS} ms.`,
+	);
+	return DEFAULT_IDLE_STABILITY_MS;
 }
 
 /**
@@ -323,6 +355,7 @@ export default function (pi: ExtensionAPI) {
 	let idleSince: number | undefined;
 
 	const summarizerEnv = resolveSummarizerEnv();
+	const idleStabilityMs = resolveIdleStabilityMs();
 
 	const notify = (ctx: ExtensionContext, message: string, level: "info" | "warning" | "error") => {
 		if (ctx.hasUI) ctx.ui.notify(message, level);
@@ -360,7 +393,7 @@ export default function (pi: ExtensionAPI) {
 	 *
 	 * Requires three things, because none alone is sufficient:
 	 * 1. the session is free of in-flight and queued work (`isSessionFree`),
-	 * 2. it has looked free continuously for `IDLE_STABILITY_MS`, so a
+	 * 2. it has looked free continuously for `idleStabilityMs`, so a
 	 *    looper's short inter-turn gap is not mistaken for "finished", and
 	 * 3. no extension has published a long-scheduled-work guard.
 	 */
@@ -368,7 +401,7 @@ export default function (pi: ExtensionAPI) {
 		if (!isSessionFree(ctx)) return false;
 		if (findExternalBusyGuard()) return false;
 		if (idleSince === undefined) return false;
-		return Date.now() - idleSince >= IDLE_STABILITY_MS;
+		return Date.now() - idleSince >= idleStabilityMs;
 	};
 
 	/** Recompute the idle-since marker; call whenever session state may change. */
@@ -377,6 +410,17 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const runCompaction = (ctx: ExtensionContext, customInstructions?: string) => {
+		// Final gate, as close to ctx.compact() as possible. The scheduled call
+		// path already verified isSafeToCompact, but a looper can start its next
+		// turn in the gap between that check and compact()'s internal
+		// `await this.abort()` — which would kill the just-started turn
+		// ("This operation was aborted"). If the window closed again, silently
+		// re-queue and let the poll loop take the next genuinely safe window.
+		// This shrinks the race; only a busy-guard publisher can eliminate it.
+		if (!isSafeToCompact(ctx)) {
+			queueCompaction(ctx, customInstructions, { silent: true });
+			return;
+		}
 		compacting = true;
 		clearWaitTimer();
 		try {
@@ -737,7 +781,7 @@ ${batchText}
 		}
 	}
 
-	function queueCompaction(ctx: ExtensionContext, customInstructions?: string) {
+	function queueCompaction(ctx: ExtensionContext, customInstructions?: string, options?: { silent?: boolean }) {
 		pending = true;
 		pendingInstructions = customInstructions;
 		const startedAt = Date.now();
@@ -768,11 +812,13 @@ ${batchText}
 			waitTimer.unref?.();
 		}, SAFE_TO_COMPACT_POLL_MS);
 		waitTimer.unref?.();
-		notify(
-			ctx,
-			"Session is busy — hot-swap compaction queued; it will run in the background as soon as the current work finishes.",
-			"info",
-		);
+		if (!options?.silent) {
+			notify(
+				ctx,
+				"Session is busy — hot-swap compaction queued; it will run in the background as soon as the current work finishes.",
+				"info",
+			);
+		}
 	}
 
 	// --- command -------------------------------------------------------------
