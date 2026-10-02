@@ -1,6 +1,6 @@
 {
 	"name": "@bramburn/ai-compact-hot-swap",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "pi coding-agent extension: background compaction with hot-swap of the live context window",
 	"license": "MIT",
 	"type": "module",
