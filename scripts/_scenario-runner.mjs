@@ -22,7 +22,7 @@ function makeMockPi({ completeImpl, scenarioName }) {
 	const providers = new Map();
 	const notifyCalls = [];
 	// Controllable session state so we can simulate a looper's inter-turn gap.
-	const state = { idle: true, pending: false, compactCalls: 0, setIdleAt: null, startedAt: Date.now() };
+	const state = { idle: true, pending: false, compactCalls: 0, compactedAt: null, setIdleAt: null, startedAt: Date.now() };
 
 	const mockModel = {
 		id: "test-model",
@@ -59,6 +59,7 @@ function makeMockPi({ completeImpl, scenarioName }) {
 		getSignal: () => undefined,
 		compact: () => {
 			state.compactCalls++;
+			if (state.compactedAt === null) state.compactedAt = Date.now();
 		},
 	};
 
@@ -154,16 +155,19 @@ async function main() {
 	const { pi, ctx, handlers, commands, providers, notifyCalls, state } = makeMockPi({ completeImpl, scenarioName: scenario });
 
 	// Scenarios that exercise the command gating rather than the summarizer.
-	if (scenario === "looper-gap" || scenario === "stable-idle") {
+	if (["looper-gap", "stable-idle", "custom-idle-window", "bad-idle-window"].includes(scenario)) {
 		// "looper-gap": the looper's next turn starts 50ms from now (pi-goal-x's
 		// CONTINUATION_IDLE_RETRY_MS), so an isIdle()-only check would compact
 		// into the gap and abort it. "stable-idle": the session stays idle.
+		// "custom-idle-window"/"bad-idle-window": session stays idle too; the
+		// assertions are about how PI_HOTSWAP_SUMMARIZER_IDLE_MS is parsed.
 		if (scenario === "looper-gap") state.setIdleAt = 50;
 
 		const mod2 = await import(`../index.ts?cb=${Date.now()}-${Math.random()}`);
 		mod2.default(pi);
 
 		const command = commands.get("hot-swap-compact");
+		const startedAt = Date.now();
 		await command.handler("", ctx);
 
 		// Give the gating logic time to either fire or settle.
@@ -173,6 +177,8 @@ async function main() {
 			scenario,
 			compactCalls: state.compactCalls,
 			notifications: notifyCalls.map((n) => n.message),
+			elapsedMs: Date.now() - startedAt,
+			compactElapsedMs: state.compactedAt !== null ? state.compactedAt - startedAt : null,
 		}));
 		return;
 	}

@@ -20,7 +20,7 @@ A naive "queue while busy, fire on `turn_end`" guard is still wrong, and the fai
 So the extension waits for a genuinely safe window before compacting, requiring all three of:
 
 1. **Session free** — `ctx.isIdle()` *and* `!ctx.hasPendingMessages()`.
-2. **Idle stable for 750 ms** — continuously free for longer than any short-gap looper's inter-turn pause, so a gap is never mistaken for "finished". Armed by `turn_end` / `agent_settled`, cleared by `turn_start`.
+2. **Idle stable for 750 ms** (default — override with `PI_HOTSWAP_SUMMARIZER_IDLE_MS`, see [Tuning](#tuning-idle-stability-window)) — continuously free for longer than any short-gap looper's inter-turn pause, so a gap is never mistaken for "finished". Armed by `turn_end` / `agent_settled`, cleared by `turn_start`.
 3. **No external busy guard** — a cross-extension opt-in for long-scheduled work (see below).
 
 A queued compaction polls every 250 ms and starts as soon as all three hold. If nothing frees up within 5 minutes it gives up with a notification and clears state rather than waiting forever. All poll timers are `unref`'d, so a pending queue never holds the host's event loop open.
@@ -190,6 +190,17 @@ This mirrors pi's own `PI_SUMMARIZER_*` env vars (same three names, same "set al
 
 The extension is a no-op. `/hot-swap-compact` calls `ctx.compact(...)` exactly like pi's built-in `/compact`, except non-blocking.
 
+### Tuning: idle-stability window
+
+`PI_HOTSWAP_SUMMARIZER_IDLE_MS` (non-negative integer, milliseconds) overrides how long the session must look continuously idle before a queued compaction fires. Default `750`.
+
+This var is independent of the custom summarizer vars — it is read whether or not they are set, because it tunes the trigger gating, not the summarizer.
+
+- **Raise it** above your loop extension's inter-turn gap if compactions intermittently abort turns with `This operation was aborted` — a looper started its next turn inside the idle window and `ctx.compact()`'s internal `abort()` killed it.
+- **Lower it** to compact sooner on genuinely quiet sessions.
+
+Even when the window has been satisfied, the extension re-checks immediately before `ctx.compact()` and silently re-queues if a turn started in the meantime. That shrinks the check-to-abort race but cannot eliminate it — only a busy-guard publisher (see above) can guarantee a looper never lands inside the window.
+
 ### Scope: this affects every compaction in the session
 
 Because the handler is wired to `session_before_compact` (not just `/hot-swap-compact`), the custom summarizer handles **all** compactions in the session once the env vars are set:
@@ -331,7 +342,7 @@ The extension is a single TypeScript file. The npm tarball publishes exactly 4 f
 
 ```sh
 npm run typecheck    # tsgo --noEmit -p tsconfig.json
-npm test             # node scripts/smoke.mjs - 34 checks, 10 scenarios
+npm test             # node scripts/smoke.mjs - 40 checks, 12 scenarios
 ```
 
 The bundled `tsconfig.json` maps `@earendil-works/pi-coding-agent` to a local pi checkout for types — adjust the `paths` entry (or remove it and rely on the installed peer dep) if your layout differs.
@@ -350,6 +361,8 @@ The bundled `tsconfig.json` maps `@earendil-works/pi-coding-agent` to a local pi
 | 7 | A working probe supplies the window - asserts the probed **65536**, not the 128 000 fallback, so the test cannot pass by coincidence |
 | 9 | Regression: goal-mode's 50 ms inter-turn gap must **not** compact (`compactCalls === 0`) |
 | 10 | A genuinely stable-idle session **does** compact, once the 750 ms window matures |
+| 11 | A short `PI_HOTSWAP_SUMMARIZER_IDLE_MS` compacts well before the 750 ms default would allow |
+| 12 | A non-numeric `PI_HOTSWAP_SUMMARIZER_IDLE_MS` warns on stderr and falls back to the default window |
 
 Scenario 9 is the one that matters most. An earlier version of the poll loop left the re-armed timer referenced, so a queued compaction held the event loop open and that scenario never exited - the suite hung rather than failing. Keep `unref()` on **every** arm point; the suite only terminates if it is there.
 
