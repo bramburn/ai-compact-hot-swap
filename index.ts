@@ -22,6 +22,11 @@
  * on first use (cached). When neither is available, it falls back to a
  * conservative 128_000 default.
  *
+ * Output-token-cap safety: when a summary generation stops at the output
+ * token cap (stopReason "length"), the batch is transparently split into
+ * smaller batches and summarized with multiple calls, rolling the summary
+ * forward — instead of failing the compaction with an incomplete summary.
+ *
  * Optional idle-stability tuning (read regardless of the summarizer vars):
  * PI_HOTSWAP_SUMMARIZER_IDLE_MS non-negative integer; how long the session
  * must look continuously idle before a queued compaction fires
@@ -539,17 +544,135 @@ ${batchText}
 			customInstructions: string | undefined,
 			turnPrefixText: string,
 			signal: AbortSignal,
-		): Promise<string> => {
+		): Promise<{ text: string; truncated: boolean }> => {
 			const summaryMessages = buildSummaryPrompt(batchMessages, previousSummary, customInstructions, turnPrefixText);
 			const response = await ctx.modelRegistry.complete(
 				model,
 				{ messages: summaryMessages },
 				{ maxTokens: 8192, signal, cacheRetention: "none", sessionId: randomUUID() },
 			);
-			return response.content
+			// A "length" stop means the summary was cut off at the output token cap;
+			// the caller decides whether to accept the partial text or re-chunk.
+			// pi's own fallback summarizer instead fails the whole compaction on
+			// exactly this signal, which is the error this handling avoids.
+			if (response.stopReason === "error") {
+				throw new Error(response.errorMessage || "Hot-swap summarizer returned an error");
+			}
+			const text = response.content
 				.filter((c): c is { type: "text"; text: string } => c.type === "text")
 				.map((c) => c.text)
 				.join("\n");
+			return { text, truncated: response.stopReason === "length" };
+		};
+
+		/**
+		 * Summarizes one batch, transparently re-chunking when the summarizer's
+		 * output hits its token cap: a truncated generation means the batch was
+		 * too much to summarize in one response, so we bisect it and summarize
+		 * each half with separate calls, rolling the summary forward across
+		 * them. Recurses until every piece produces a complete summary.
+		 *
+		 * A single message that still overflows the cap keeps its partial
+		 * summary as best effort — failing the whole compaction over one
+		 * oversized message (e.g. a giant pasted log) would be worse.
+		 */
+		const summarizeBatchResilient = async (
+			ctx: ExtensionContext,
+			model: SummarizerModel,
+			batch: MessagesToSummarize,
+			previousSummary: string | undefined,
+			customInstructions: string | undefined,
+			turnPrefixText: string,
+			signal: AbortSignal,
+			uiNotify: Notify,
+		): Promise<string | undefined> => {
+			const { text, truncated } = await callSummarizer(ctx, model, batch, previousSummary, customInstructions, turnPrefixText, signal);
+			if (!truncated) return text;
+			if (signal.aborted) return undefined;
+			if (batch.length <= 1) {
+				uiNotify(
+					"Hot-swap summarizer: a single message exceeds the output token cap; keeping a partial summary for it.",
+					"warning",
+				);
+				// Best effort: keep the partial summary rather than failing the
+				// whole compaction over one oversized message.
+				return text;
+			}
+			uiNotify(
+				`Hot-swap summarizer: batch of ${batch.length} messages hit the output token cap; splitting into two calls.`,
+				"info",
+			);
+			const mid = Math.ceil(batch.length / 2);
+			const first = await summarizeBatchResilient(
+				ctx,
+				model,
+				batch.slice(0, mid),
+				previousSummary,
+				customInstructions,
+				turnPrefixText,
+				signal,
+				uiNotify,
+			);
+			if (signal.aborted) return undefined;
+			const second = await summarizeBatchResilient(
+				ctx,
+				model,
+				batch.slice(mid),
+				first !== undefined ? capSummaryLength(first, PREVIOUS_SUMMARY_CAP_TOKENS) : previousSummary,
+				customInstructions,
+				turnPrefixText,
+				signal,
+				uiNotify,
+			);
+			return second ?? first;
+		};
+
+		/**
+		 * Splits the backlog into batches within `budgetTokens` and produces a
+		 * rolling summary across sequential calls. Individual batches that hit
+		 * the summarizer's output token cap are bisected further by
+		 * summarizeBatchResilient, so the output cap always resolves into more
+		 * (smaller) calls instead of a failed compaction.
+		 */
+		const runRollingChunkLoop = async (
+			ctx: ExtensionContext,
+			model: SummarizerModel,
+			messagesToSummarize: MessagesToSummarize,
+			budgetTokens: number,
+			customInstructions: string | undefined,
+			turnPrefixText: string,
+			signal: AbortSignal,
+			uiNotify: Notify,
+			label: string,
+		): Promise<string | undefined> => {
+			const batches = chunkMessages(messagesToSummarize, budgetTokens);
+			let rollingSummary: string | undefined;
+
+			for (let i = 0; i < batches.length; i++) {
+				if (signal.aborted) return undefined;
+				const batch = batches[i];
+				if (batches.length > 1) {
+					uiNotify(
+						`Hot-swap summarizer: ${label} ${i + 1}/${batches.length}...`,
+						"info",
+					);
+				}
+				const cappedPrev = rollingSummary
+					? capSummaryLength(rollingSummary, PREVIOUS_SUMMARY_CAP_TOKENS)
+					: undefined;
+				rollingSummary = await summarizeBatchResilient(
+					ctx,
+					model,
+					batch,
+					cappedPrev,
+					customInstructions,
+					turnPrefixText,
+					signal,
+					uiNotify,
+				);
+			}
+
+			return rollingSummary;
 		};
 
 		/**
@@ -577,51 +700,56 @@ ${batchText}
 					PROMPT_OVERHEAD_TOKENS * 4,
 			);
 
-			// Single-shot fast path: everything fits in one batch.
+			// Single-shot fast path: everything fits in one batch — as long as
+			// the resulting summary doesn't hit the output token cap. A truncated
+			// summary or a prompt overflow both downgrade to the chunked path,
+			// which breaks the context into multiple smaller calls.
 			if (totalEstimatedTokens <= maxBatchTokens) {
-				return await callSummarizer(
-					ctx,
-					model,
-					messagesToSummarize,
-					undefined,
-					customInstructions,
-					turnPrefixText,
-					signal,
-				);
-			}
-
-			uiNotify(
-				`Hot-swap summarizer: conversation (~${totalEstimatedTokens} estimated tokens) exceeds summarizer window (${window}); chunking.`,
-				"info",
-			);
-
-			const batches = chunkMessages(messagesToSummarize, maxBatchTokens);
-			let rollingSummary: string | undefined;
-
-			for (let i = 0; i < batches.length; i++) {
-				if (signal.aborted) return undefined;
-				const batch = batches[i];
-				if (batches.length > 1) {
+				try {
+					const { text, truncated } = await callSummarizer(
+						ctx,
+						model,
+						messagesToSummarize,
+						undefined,
+						customInstructions,
+						turnPrefixText,
+						signal,
+					);
+					if (!truncated) return text;
+					if (signal.aborted) return undefined;
 					uiNotify(
-						`Hot-swap summarizer: chunked summary ${i + 1}/${batches.length}...`,
+						"Hot-swap summarizer: summary hit the output token cap; switching to chunked summarization with multiple calls.",
 						"info",
 					);
+				} catch (error) {
+					if (signal.aborted) return undefined;
+					if (isContextOverflowError(error)) {
+						uiNotify(
+							"Hot-swap summarizer: prompt overflowed the summarizer window; switching to chunked summarization.",
+							"info",
+						);
+					} else {
+						throw error;
+					}
 				}
-				const cappedPrev = rollingSummary
-					? capSummaryLength(rollingSummary, PREVIOUS_SUMMARY_CAP_TOKENS)
-					: undefined;
-				rollingSummary = await callSummarizer(
-					ctx,
-					model,
-					batch,
-					cappedPrev,
-					customInstructions,
-					turnPrefixText,
-					signal,
+			} else {
+				uiNotify(
+					`Hot-swap summarizer: conversation (~${totalEstimatedTokens} estimated tokens) exceeds summarizer window (${window}); chunking.`,
+					"info",
 				);
 			}
 
-			return rollingSummary;
+			return await runRollingChunkLoop(
+				ctx,
+				model,
+				messagesToSummarize,
+				maxBatchTokens,
+				customInstructions,
+				turnPrefixText,
+				signal,
+				uiNotify,
+				"chunked summary",
+			);
 		};
 
 		pi.on("session_before_compact", async (event, ctx) => {
@@ -709,29 +837,17 @@ ${batchText}
 					const window = await resolveSummarizerWindow();
 					const tightBudget = Math.max(1024, Math.floor((window - RESERVE_TOKENS - PROMPT_OVERHEAD_TOKENS) / 2));
 					const turnPrefixText = serializeConversation(convertToLlm(turnPrefixMessages));
-					const batches = chunkMessages(messagesToSummarize, tightBudget);
-					let rollingSummary: string | undefined;
-					for (let i = 0; i < batches.length; i++) {
-						if (signal.aborted) return;
-						if (batches.length > 1) {
-							uiNotify(
-								`Hot-swap summarizer: tight chunk ${i + 1}/${batches.length}...`,
-								"info",
-							);
-						}
-						const cappedPrev = rollingSummary
-							? capSummaryLength(rollingSummary, PREVIOUS_SUMMARY_CAP_TOKENS)
-							: undefined;
-						rollingSummary = await callSummarizer(
-							ctx,
-							model,
-							batches[i],
-							cappedPrev,
-							customInstructions,
-							turnPrefixText,
-							signal,
-						);
-					}
+					const rollingSummary = await runRollingChunkLoop(
+						ctx,
+						model,
+						messagesToSummarize,
+						tightBudget,
+						customInstructions,
+						turnPrefixText,
+						signal,
+						uiNotify,
+						"tight chunk",
+					);
 					if (signal.aborted) return;
 					if (!rollingSummary || !rollingSummary.trim()) {
 						notify(ctx, "Hot-swap summary was empty after retry, using default compaction", "warning");

@@ -128,16 +128,25 @@ async function main() {
 
 	// Build the complete impl per scenario. Each returns a unique stub summary
 	// so we can assert that the LAST one is what the handler returned.
-	const makeComplete = (behavior) => async () => {
+	const makeComplete = (behavior) => async (_model, context) => {
 		completeCalls++;
 		if (behavior === "overflow-first") {
 			if (completeCalls === 1) {
 				throw new Error("context_length_exceeded: too many tokens");
 			}
 		}
+		// Output-token-cap simulation: any prompt whose serialized conversation
+		// exceeds the threshold gets a "length" stop (partial summary), forcing
+		// the extension to bisect into smaller batches with multiple calls.
+		const truncThreshold = behavior === "trunc-by-size" ? 25_000 : behavior === "trunc-singles" ? 20_000 : -1;
+		let stopReason = "stop";
+		if (truncThreshold > 0) {
+			const promptText = String(context?.messages?.[0]?.content?.[0]?.text ?? "");
+			if (promptText.length > truncThreshold) stopReason = "length";
+		}
 		const text = `stub-summary-${completeCalls}`;
 		summaryTexts.push(text);
-		return { content: [{ type: "text", text }], usage: { inputTokens: 100, outputTokens: 50 } };
+		return { content: [{ type: "text", text }], stopReason, usage: { inputTokens: 100, outputTokens: 50 } };
 	};
 
 	const behaviorMap = {
@@ -149,6 +158,8 @@ async function main() {
 		"bad-window": "always-succeed",
 		"hint-vs-registered": "always-succeed",
 		"probe-success": "always-succeed",
+		"truncated-single": "trunc-by-size",
+		"truncated-single-message": "trunc-singles",
 	};
 	const completeImpl = makeComplete(behaviorMap[scenario] || "always-succeed");
 
@@ -232,6 +243,19 @@ async function main() {
 			messages = makeFakeMessages(100, 20000); // ~500k tokens estimated
 			turnPrefixMessages = [];
 			break;
+		case "truncated-single":
+			// Fits the summarizer window in one batch, but the summary generation
+			// hits the output token cap: must bisect into 3 + 2 messages (two more
+			// calls) instead of failing the compaction.
+			messages = makeFakeMessages(5, 6000); // ~7.5k tokens estimated
+			turnPrefixMessages = [];
+			break;
+		case "truncated-single-message":
+			// Every batch — down to a single 60k-char message — exceeds the cap:
+			// bisection bottoms out and keeps partial summaries with a warning.
+			messages = makeFakeMessages(3, 60000);
+			turnPrefixMessages = [];
+			break;
 		default:
 			messages = makeFakeMessages(5, 4000);
 			turnPrefixMessages = [];
@@ -280,6 +304,10 @@ async function main() {
 		chunkNotifications: notifyCalls.filter(n => n.message.includes("chunked summary")).length,
 		exceedsWindowNotification: notifyCalls.filter(n => n.message.includes("exceeds summarizer window")).length,
 		exceedsWindowText: notifyCalls.find(n => n.message.includes("exceeds summarizer window"))?.message || null,
+		splitNotifications: notifyCalls.filter(n => n.message.includes("splitting into two calls")).length,
+		partialSummaryWarnings: notifyCalls.filter(n => n.message.includes("partial summary")).length,
+		capSwitchNotifications: notifyCalls.filter(n => n.message.includes("hit the output token cap; switching")).length,
+		notifications: notifyCalls.map((n) => n.message),
 		notifyCount: notifyCalls.length,
 	}));
 

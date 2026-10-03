@@ -285,6 +285,41 @@ async function main() {
 		}
 	}
 
+	section("Scenario 13: output token cap on single-shot — bisects into multiple calls");
+	{
+		const out = runScenario("truncated-single", {
+			PI_HOTSWAP_SUMMARIZER_BASE_URL: "http://localhost:11434/v1",
+			PI_HOTSWAP_SUMMARIZER_API_KEY: "test",
+			PI_HOTSWAP_SUMMARIZER_MODEL: "test-model",
+			PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW: "128000",
+		});
+		assertTrue("subprocess OK", out.ok, out.stderr);
+		if (out.ok) {
+			// 1 truncated single-shot + 1 full-batch retry (also truncated)
+			// + bisected 3-message and 2-message batches.
+			assertEqual("completeCalls", out.result.completeCalls, 4);
+			assertEqual("returned summary is the LAST rolling summary", out.result.returnedSummary, "stub-summary-4");
+			assertTrue("cap-switch notification fired", out.result.capSwitchNotifications >= 1);
+			assertTrue("batch split notification fired", out.result.splitNotifications >= 1);
+			assertEqual("no partial-summary warnings", out.result.partialSummaryWarnings, 0);
+		}
+	}
+
+	section("Scenario 14: output token cap down to a single message — keeps partial summary with warning");
+	{
+		const out = runScenario("truncated-single-message", {
+			PI_HOTSWAP_SUMMARIZER_BASE_URL: "http://localhost:11434/v1",
+			PI_HOTSWAP_SUMMARIZER_API_KEY: "test",
+			PI_HOTSWAP_SUMMARIZER_MODEL: "test-model",
+			PI_HOTSWAP_SUMMARIZER_CONTEXT_WINDOW: "128000",
+		});
+		assertTrue("subprocess OK", out.ok, out.stderr);
+		if (out.ok) {
+			assertTrue("compaction still returned a summary", !!out.result.returnedSummary);
+			assertTrue("partial-summary warning fired", out.result.partialSummaryWarnings >= 1, `got ${out.result.partialSummaryWarnings}`);
+		}
+	}
+
 	console.log("");
 	if (failed === 0) {
 		console.log(`${GREEN}✓ All ${passed} checks passed${RESET}`);
