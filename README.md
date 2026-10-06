@@ -1,10 +1,19 @@
 # ai-compact-hot-swap
 
+> **Archived — superseded by [bramburn/pi](https://github.com/bramburn/pi).**
+> Background compaction with hot-swap is now native in the bramburn/pi fork: `/compact` and
+> threshold-triggered auto-compaction summarize in the background without aborting or blocking
+> the session, and the summary is swapped in at the next request. That implementation lives in
+> [`packages/coding-agent/src/core/agent-session.ts`](https://github.com/bramburn/pi/blob/main/packages/coding-agent/src/core/agent-session.ts)
+> (`compactInBackground`). Use bramburn/pi instead of this extension — it is no longer maintained,
+> and a true hot swap cannot be delivered from the extension API (see "Why queueing is not enough"
+> below). This repository remains readable for design notes.
+
 [![npm version](https://img.shields.io/npm/v/@bramburn/ai-compact-hot-swap?color=cb3837&logo=npm)](https://www.npmjs.com/package/@bramburn/ai-compact-hot-swap)
 [![npm downloads](https://img.shields.io/npm/dm/@bramburn/ai-compact-hot-swap?color=cb3837&logo=npm)](https://www.npmjs.com/package/@bramburn/ai-compact-hot-swap)
 [![license](https://img.shields.io/npm/l/@bramburn/ai-compact-hot-swap)](LICENSE)
 
-A [pi](https://github.com/earendil-works/pi) coding-agent extension providing a manually-invoked `/hot-swap-compact` command that compacts the session context **in the background** and hot-swaps the live context window when summarization completes.
+A [pi](https://github.com/earendil-works/pi) coding-agent extension providing a manually-invoked `/hot-swap-compact` command that compacts the session context **in the background** and hot-swaps the live context window when summarization completes. **Superseded by native background compaction in [bramburn/pi](https://github.com/bramburn/pi) — see the notice above.**
 
 ## Why
 
